@@ -1,7 +1,5 @@
 
 
-
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -274,6 +272,175 @@ def apply_td_advanced_signals(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ============================================================
+# Z3 MOMENTUM SCORE  (ported from mikeChart.js)
+# ============================================================
+
+def _robust_sigma_mad(arr: list) -> float | None:
+    """MAD-based robust sigma estimator. Matches JS robustSigmaMAD."""
+    a = [v for v in arr if v is not None and not np.isnan(v)]
+    if len(a) < 5:
+        return None
+    med = float(np.median(a))
+    mad = float(np.median([abs(v - med) for v in a]))
+    if np.isnan(mad):
+        return None
+    return max(mad * 1.4826, 1e-6)   # MAD → sigma, never zero
+
+
+def _bps_from_log_return(curr: float, prev: float) -> float | None:
+    """Log return in basis points. Matches JS bpsFromLogReturn."""
+    if curr is None or prev is None or curr <= 0 or prev <= 0:
+        return None
+    return np.log(curr / prev) * 10_000
+
+
+def compute_z3_series(df: pd.DataFrame, sig_n: int = 9) -> pd.Series:
+    """
+    Rolling Z3 momentum score for every bar.
+    Exactly mirrors JS z3Map logic:
+      z3[i] = (b0 + b1 + b2) / (robustSigmaMAD(window) * √3)
+    clamped to [-8, 8].
+    Returns a float Series (NaN where not computable).
+    """
+    closes = pd.to_numeric(df["Close"], errors="coerce").values
+    n = len(closes)
+    SQRT3 = np.sqrt(3)
+
+    # 1) BPS for each bar (log return × 10000)
+    bps = [None] * n
+    for i in range(1, n):
+        bps[i] = _bps_from_log_return(closes[i], closes[i - 1])
+
+    # 2) Z3 scores
+    scores = [np.nan] * n
+    for i in range(n):
+        if i < sig_n + 2:
+            continue
+        window = [bps[j] for j in range(i - sig_n + 1, i + 1) if bps[j] is not None]
+        if len(window) < max(5, int(sig_n * 0.6)):
+            continue
+        b0, b1, b2 = bps[i], bps[i - 1], bps[i - 2]
+        if any(v is None for v in [b0, b1, b2]):
+            continue
+        sigma = _robust_sigma_mad(window)
+        if sigma is None or sigma <= 0:
+            continue
+        z3 = (b0 + b1 + b2) / (sigma * SQRT3)
+        scores[i] = max(-8.0, min(8.0, z3))
+
+    return pd.Series(scores, index=df.index, name="Z3_Score")
+
+
+def compute_mae_line(df: pd.DataFrame) -> dict | None:
+    """
+    Find MAE (Maximum Adverse Excursion) line from the latest blocked E1 (⏳).
+    Mirrors JS maeLine useMemo.
+    Returns dict with keys: e1_idx, mae_idx, end_idx, side, blocked_f, mae_f
+    or None if no blocked E1 is found.
+    """
+    n = len(df)
+    call_col = "Call_FirstEntry_Emoji" if "Call_FirstEntry_Emoji" in df.columns else None
+    put_col  = "Put_FirstEntry_Emoji"  if "Put_FirstEntry_Emoji"  in df.columns else None
+    if call_col is None and put_col is None:
+        return None
+
+    # 1) Scan backward for latest blocked E1
+    e1_idx, side = -1, None
+    for i in range(n - 1, -1, -1):
+        if call_col and "⏳" in str(df[call_col].iloc[i]):
+            e1_idx, side = i, "call"
+            break
+        if put_col and "⏳" in str(df[put_col].iloc[i]):
+            e1_idx, side = i, "put"
+            break
+
+    if e1_idx < 0:
+        return None
+
+    # 2) Blocked entry F-level at the ⏳ bar
+    blocked_f = float(df["F_numeric"].iloc[e1_idx])
+    if np.isnan(blocked_f):
+        return None
+
+    # 3) End of window = first opposite *real* E1 (non-⏳, non-empty)
+    end_idx = n - 1
+    for j in range(e1_idx + 1, n):
+        if side == "put" and call_col:
+            val = str(df[call_col].iloc[j])
+            if val and val not in ("", "nan") and "⏳" not in val:
+                end_idx = j
+                break
+        if side == "call" and put_col:
+            val = str(df[put_col].iloc[j])
+            if val and val not in ("", "nan") and "⏳" not in val:
+                end_idx = j
+                break
+
+    # 4) MAE = worst F_numeric from e1_idx → end_idx
+    mae_f, mae_idx = blocked_f, e1_idx
+    for i in range(e1_idx, end_idx + 1):
+        f = float(df["F_numeric"].iloc[i])
+        if np.isnan(f):
+            continue
+        if side == "call" and f < mae_f:
+            mae_f, mae_idx = f, i
+        elif side == "put" and f > mae_f:
+            mae_f, mae_idx = f, i
+
+    return {
+        "e1_idx":   e1_idx,
+        "mae_idx":  mae_idx,
+        "end_idx":  end_idx,
+        "side":     side,
+        "blocked_f": blocked_f,
+        "mae_f":    mae_f,
+    }
+
+
+def apply_z3_key(df: pd.DataFrame, threshold: float = 1.5) -> pd.DataFrame:
+    """
+    Compute Z3 scores and mark the Z3 Key (🔑):
+    the FIRST bar after MAE where Z3 crosses into the favorable ignition zone
+    (z >= +threshold for call, z <= -threshold for put).
+    Adds columns: 'Z3_Score', 'Z3_Key_Emoji', 'Z3_Key_Side'.
+    Mirrors JS z3Key useMemo.
+    """
+    df = df.copy()
+    df["Z3_Score"]    = compute_z3_series(df)
+    df["Z3_Key_Emoji"] = ""
+    df["Z3_Key_Side"]  = ""
+
+    mae = compute_mae_line(df)
+    if mae is None:
+        return df
+
+    side     = mae["side"]
+    mae_idx  = mae["mae_idx"]
+    end_idx  = mae["end_idx"]
+    scores   = df["Z3_Score"].values
+
+    def ignited(z: float) -> bool:
+        if np.isnan(z):
+            return False
+        return z >= threshold if side == "call" else z <= -threshold
+
+    # Scan from first bar AFTER MAE tick
+    start = mae_idx + 1
+    if start > end_idx:
+        return df
+
+    for i in range(start, end_idx + 1):
+        z0 = scores[i]
+        z1 = scores[i - 1] if i > 0 else np.nan
+        if not ignited(z1) and ignited(z0):
+            df.iat[i, df.columns.get_loc("Z3_Key_Emoji")] = "🔑"
+            df.iat[i, df.columns.get_loc("Z3_Key_Side")]  = side
+            break  # only the FIRST ignition crossing
+
+    return df
+
+
 def compute_initial_balance(df: pd.DataFrame, bars: int = 12):
     """Compute IB High/Low and thirds using first `bars` bars of F_numeric."""
     if df.empty or "F_numeric" not in df.columns or len(df) < bars:
@@ -416,52 +583,44 @@ def build_chart(
 )
 
     # ==========================
-    # RVOL Triangles (F_numeric + 3)
+    # ♕ QUEEN (Kijun Cross)
     # ==========================
-    if "RVOL_5" in intraday.columns and "F_numeric" in intraday.columns:
-        mask_rvol_extreme = intraday["RVOL_5"] > 1.8
-        mask_rvol_strong = (intraday["RVOL_5"] >= 1.5) & (intraday["RVOL_5"] < 1.8)
-        mask_rvol_moderate = (intraday["RVOL_5"] >= 1.2) & (intraday["RVOL_5"] < 1.5)
+    if "Kijun_F" in intraday.columns and "F_numeric" in intraday.columns:
+        mike  = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+        kijun = pd.to_numeric(intraday["Kijun_F"],   errors="coerce")
 
-        # Extreme (red)
-        if mask_rvol_extreme.any():
-            scatter_rvol_extreme = go.Scatter(
-                x=intraday.loc[mask_rvol_extreme, "Time"],
-                y=intraday.loc[mask_rvol_extreme, "F_numeric"] + 3,
-                mode="markers",
-                marker=dict(symbol="triangle-up", size=10, color="red"),
-                name="RVOL > 1.8 (Extreme Surge)",
-                text=["Extreme Volume"] * int(mask_rvol_extreme.sum()),
-                hovertemplate="Time: %{x}<br>F%: %{y}<br>%{text}<extra></extra>",
+        for i in range(1, len(intraday)):
+            m0, m1 = mike.iloc[i], mike.iloc[i - 1]
+            k0, k1 = kijun.iloc[i], kijun.iloc[i - 1]
+            if any(pd.isna(v) for v in [m0, m1, k0, k1]):
+                continue
+
+            up_cross   = m1 < k1 and m0 >= k0
+            down_cross = m1 > k1 and m0 <= k0
+            if not up_cross and not down_cross:
+                continue
+
+            color = "#22c55e" if up_cross else "#ff3b3b"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[intraday["Time"].iloc[i]],
+                    y=[mike.iloc[i]],
+                    mode="text",
+                    text=["♕"],
+                    textposition="middle center",
+                    textfont=dict(size=30, color=color),
+                    name="♕",
+                    showlegend=False,
+                    hovertemplate=(
+                        "Time: %{x}<br>"
+                        "F%: %{y}<br>"
+                        f"♕ {'↑' if up_cross else '↓'}"
+                        "<extra></extra>"
+                    ),
+                ),
+                row=1, col=1,
             )
-            fig.add_trace(scatter_rvol_extreme, row=1, col=1)
-
-        # Strong (orange)
-        if mask_rvol_strong.any():
-            scatter_rvol_strong = go.Scatter(
-                x=intraday.loc[mask_rvol_strong, "Time"],
-                y=intraday.loc[mask_rvol_strong, "F_numeric"] + 3,
-                mode="markers",
-                marker=dict(symbol="triangle-up", size=10, color="orange"),
-                name="RVOL 1.5–1.79 (Strong Surge)",
-                text=["Strong Volume"] * int(mask_rvol_strong.sum()),
-                hovertemplate="Time: %{x}<br>F%: %{y}<br>%{text}<extra></extra>",
-            )
-            fig.add_trace(scatter_rvol_strong, row=1, col=1)
-
-        # Moderate (pink)
-        if mask_rvol_moderate.any():
-            scatter_rvol_moderate = go.Scatter(
-                x=intraday.loc[mask_rvol_moderate, "Time"],
-                y=intraday.loc[mask_rvol_moderate, "F_numeric"] + 3,
-                mode="markers",
-                marker=dict(symbol="triangle-up", size=10, color="pink"),
-                name="RVOL 1.2–1.49 (Moderate Surge)",
-                text=["Moderate Volume"] * int(mask_rvol_moderate.sum()),
-                hovertemplate="Time: %{x}<br>F%: %{y}<br>%{text}<extra></extra>",
-            )
-            fig.add_trace(scatter_rvol_moderate, row=1, col=1)
-
     # TD Supply line (F%)
     if "TD Supply Line F" in intraday.columns:
         fig.add_trace(
@@ -469,7 +628,7 @@ def build_chart(
                 x=intraday["Time"],
                 y=intraday["TD Supply Line F"],
                 mode="lines",
-                line=dict(width=0.8, color="#8A2BE2", dash="dot"),
+                line=dict(width=0.3, color="#8A2BE2", dash="dot"),
                 name="TD Supply F%",
                 hovertemplate="Time: %{x}<br>Supply (F%): %{y:.2f}<extra></extra>",
             ),
@@ -483,79 +642,14 @@ def build_chart(
                 x=intraday["Time"],
                 y=intraday["TD Demand Line F"],
                 mode="lines",
-                line=dict(width=0.8, color="#5DADE2", dash="dot"),
+                line=dict(width=0.3, color="#5DADE2", dash="dot"),
                 name="TD Demand F%",
                 hovertemplate="Time: %{x}<br>Demand (F%): %{y:.2f}<extra></extra>",
             ),
             row=1, col=1,
         )
 
-    # TDST markers
-    if "TDST" in intraday.columns:
-        tdst_buy_mask = intraday["TDST"].str.contains("Buy TDST", na=False)
-        tdst_sell_mask = intraday["TDST"].str.contains("Sell TDST", na=False)
 
-        fig.add_trace(
-            go.Scatter(
-                x=intraday.loc[tdst_buy_mask, "Time"],
-                y=intraday.loc[tdst_buy_mask, "F_numeric"],
-                mode="text",
-                text=["⎯"] * int(tdst_buy_mask.sum()),
-                textposition="middle center",
-                textfont=dict(size=29, color="green"),
-                name="Buy TDST",
-                hovertemplate="Time: %{x}<br>F%: %{y}<br>%{text}<extra></extra>",
-            ),
-            row=1, col=1,
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=intraday.loc[tdst_sell_mask, "Time"],
-                y=intraday.loc[tdst_sell_mask, "F_numeric"],
-                mode="text",
-                text=["⎯"] * int(tdst_sell_mask.sum()),
-                textposition="middle center",
-                textfont=dict(size=29, color="red"),
-                name="Sell TDST",
-                hovertemplate="Time: %{x}<br>F%: %{y}<br>%{text}<extra></extra>",
-            ),
-            row=1, col=1,
-        )
-
-    # # Heaven Cloud
-    # if "Heaven_Cloud" in intraday.columns:
-    #     cloud_mask = intraday["Heaven_Cloud"] == "☁️"
-    #     fig.add_trace(
-    #         go.Scatter(
-    #             x=intraday.loc[cloud_mask, "Time"],
-    #             y=intraday.loc[cloud_mask, "F_numeric"] + 100,
-    #             mode="text",
-    #             text=intraday.loc[cloud_mask, "Heaven_Cloud"],
-    #             textposition="top center",
-    #             textfont=dict(size=21),
-    #             name="Heaven ☁️",
-    #             hovertemplate="Time: %{x}<br>Above TD Supply Line<extra></extra>",
-    #         ),
-    #         row=1, col=1,
-    #     )
-
-    # # Drizzle
-    # if "Drizzle_Emoji" in intraday.columns:
-    #     drizzle_mask = intraday["Drizzle_Emoji"] == "🌧️"
-    #     fig.add_trace(
-    #         go.Scatter(
-    #             x=intraday.loc[drizzle_mask, "Time"],
-    #             y=intraday.loc[drizzle_mask, "F_numeric"] + 100,
-    #             mode="text",
-    #             text=intraday.loc[drizzle_mask, "Drizzle_Emoji"],
-    #             textposition="bottom center",
-    #             textfont=dict(size=21),
-    #             name="Price Dropped Below Demand 🌧️",
-    #             hovertemplate="Time: %{x}<br>F%: %{y}<br>Crossed Below Demand<extra></extra>",
-    #         ),
-    #         row=1, col=1,
-    #     )
 
     # MIDAS curves
     if "MIDAS_Bear" in intraday.columns:
@@ -609,62 +703,7 @@ def build_chart(
         )
 
 
-    # Tenkan–Kijun Cross Signals
-    if "Tenkan_Kijun_Cross" in intraday.columns:
-        mask_tk_sun = intraday["Tenkan_Kijun_Cross"] == "🦅"      # bullish
-        mask_tk_moon = intraday["Tenkan_Kijun_Cross"] == "🐦‍⬛"   # bearish
 
-        # 🌞 Bullish Cross → Yellow dot
-        if mask_tk_sun.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[mask_tk_sun, "Time"],
-                    y=intraday.loc[mask_tk_sun, "F_numeric"],
-                    mode="markers",
-                    marker=dict(
-                        color="#2ecc71",  # gold/yellow
-                        size=11,
-                        symbol="circle",
-                    ),
-                    name="Bullish Tenkan-Kijun Cross",
-                    hovertemplate=(
-                        "Time: %{x}<br>"
-                        "F%: %{y:.0f}<br>"
-                        "Tenkan > Kijun"
-                        "<extra></extra>"
-                    ),
-                ),
-                row=1,
-                col=1,
-            )
-
-        # 🌙 Bearish Cross → Black dot
-        if mask_tk_moon.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[mask_tk_moon, "Time"],
-                    y=intraday.loc[mask_tk_moon, "F_numeric"],
-                    mode="markers",
-                    marker=dict(
-                        color="#ff4d4d",
-                        size=11,
-                        symbol="circle",
-                    ),
-                    name="Bearish Tenkan-Kijun Cross",
-                    hovertemplate=(
-                        "Time: %{x}<br>"
-                        "F%: %{y:.0f}<br>"
-                        "Tenkan < Kijun"
-                        "<extra></extra>"
-                    ),
-                ),
-                row=1,
-                col=1,
-            )
-
-    # ==========================
-    # Bollinger Bands on F%
-    # ==========================
     if {"F% Upper", "F% Lower", "F% MA"}.issubset(intraday.columns):
         # (B) Upper Band
         upper_band = go.Scatter(
@@ -699,111 +738,162 @@ def build_chart(
 
 
 
-    # 🐝 BBW Tight → bees above Mike
+    # 🐝 BBW Tight → ♗ above/below Mike
     if "BBW_Tight_Emoji" in intraday.columns:
         mask_bbw_tight = intraday["BBW_Tight_Emoji"] == "🐝"
 
         if mask_bbw_tight.any():
-            scatter_bishop_tight = go.Scatter(
-                x=intraday.loc[mask_bbw_tight, "Time"],
-                y=intraday.loc[mask_bbw_tight, "F_numeric"] + 50,  # vertical offset
-                mode="text",
-                text=["🐝"] * int(mask_bbw_tight.sum()),
-                textposition="top center",
-                textfont=dict(size=12, color="mediumvioletred"),
-                name="BBW Tight (🐝)",
-                hovertemplate=(
-                    "Time: %{x}<br>"
-                    "F%: %{y:.2f}<br>"
-                    "BBW Tight Compression 🐝<extra></extra>"
-                ),
-            )
-            fig.add_trace(scatter_bishop_tight, row=1, col=1)
+            if "Kijun_F" in intraday.columns:
+                mike  = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+                kijun = pd.to_numeric(intraday["Kijun_F"],   errors="coerce")
+                above_mask = mask_bbw_tight & (mike >= kijun)
+                below_mask = mask_bbw_tight & (mike <  kijun)
+            else:
+                above_mask = mask_bbw_tight
+                below_mask = pd.Series(False, index=intraday.index)
+
+            offset = 50
+
+            for mask, pos_offset, textpos in [
+                (above_mask, +offset, "top center"),
+                (below_mask, -offset, "bottom center"),
+            ]:
+                if mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=intraday.loc[mask, "Time"],
+                            y=intraday.loc[mask, "F_numeric"] + pos_offset,
+                            mode="text",
+                            text=["♗"] * int(mask.sum()),
+                            textposition=textpos,
+                            textfont=dict(size=22, color="#FACC15"),
+                            name="BBW Tight ♗",
+                            showlegend=False,
+                            hovertemplate=(
+                                "Time: %{x}<br>"
+                                "F%: %{y:.2f}<br>"
+                                "BBW Tight Squeeze ♗<extra></extra>"
+                            ),
+                        ),
+                        row=1, col=1,
+                    )
 
 
-
-    # 🟢 BBW Expansion Alerts
-    if {"BBW Alert", "BBW_Ratio"}.issubset(intraday.columns):
+        # BBW Expansion ♗
+    if "BBW Alert" in intraday.columns:
         mask_bbw_alert = intraday["BBW Alert"] != ""
 
         if mask_bbw_alert.any():
-            scatter_bbw_alert = go.Scatter(
-                x=intraday.loc[mask_bbw_alert, "Time"],
-                y=intraday.loc[mask_bbw_alert, "F_numeric"] - 16,  # small offset
-                mode="text",
-                text=intraday.loc[mask_bbw_alert, "BBW Alert"],
-                textposition="bottom center",
-                textfont=dict(size=12),
-                name="BBW Expansion Alert",
-                hovertemplate=(
-                    "Time: %{x}<br>"
-                    "BBW Ratio: %{customdata:.2f}<extra></extra>"
+            if "Kijun_F" in intraday.columns:
+                mike  = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+                kijun = pd.to_numeric(intraday["Kijun_F"],   errors="coerce")
+                above_mask = mask_bbw_alert & (mike >= kijun)
+                below_mask = mask_bbw_alert & (mike <  kijun)
+            else:
+                above_mask = mask_bbw_alert
+                below_mask = pd.Series(False, index=intraday.index)
+
+            for mask, pos_offset, textpos, color in [
+                (above_mask, +50, "top center",    "#22c55e"),
+                (below_mask, -50, "bottom center", "#ff3b3b"),
+            ]:
+                if mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=intraday.loc[mask, "Time"],
+                            y=intraday.loc[mask, "F_numeric"] + pos_offset,
+                            mode="text",
+                            text=["♗"] * int(mask.sum()),
+                            textposition=textpos,
+                            textfont=dict(size=24, color=color),
+                            name="BBW Expansion ♗",
+                            showlegend=False,
+                            hovertemplate=(
+                                "Time: %{x}<br>"
+                                "F%: %{y}<br>"
+                                "♗ BBW Expansion<extra></extra>"
+                            ),
+                        ),
+                        row=1, col=1,
+                    )
+    # ==========================
+    # Marengo ♞ (North & South)
+    # ==========================
+    if "Marengo" in intraday.columns:
+        marengo_mask = intraday["Marengo"] == "🐎"
+        if marengo_mask.any():
+            fig.add_trace(
+                go.Scatter(
+                    x=intraday.loc[marengo_mask, "Time"],
+                    y=intraday.loc[marengo_mask, "F_numeric"] + 100,
+                    mode="text",
+                    text=["♞"] * int(marengo_mask.sum()),
+                    textfont=dict(size=24, color="#22D3EE"),
+                    textposition="top center",
+                    name="Marengo ♞",
+                    showlegend=False,
+                    hovertemplate="Time: %{x}<br>F%: %{y}<br>♞ Marengo Up<extra></extra>",
                 ),
-                customdata=intraday.loc[mask_bbw_alert, "BBW_Ratio"],
+                row=1, col=1,
             )
 
-            fig.add_trace(scatter_bbw_alert, row=1, col=1)
-
-        # ==========================
-        # Marengo 🐎 (North & South)
-        # ==========================
-        if "Marengo" in intraday.columns:
-            marengo_mask = intraday["Marengo"] == "🐎"
-            if marengo_mask.any():
-                offset = 100  # adjust if you want more/less separation
-                marengo_trace = go.Scatter(
-                    x=intraday.loc[marengo_mask, "Time"],
-                    y=intraday.loc[marengo_mask, "F% Upper"] + offset,
-                    mode="text",
-                    text=["🐎"] * int(marengo_mask.sum()),
-                    textfont=dict(size=22),
-                    textposition="top left",
-                    name="Marengo",
-                    showlegend=True,
-                )
-                fig.add_trace(marengo_trace, row=1, col=1)
-
-        if "South_Marengo" in intraday.columns:
-            south_mask = intraday["South_Marengo"] == "🐎"
-            if south_mask.any():
-                offset_south = 100
-                south_marengo_trace = go.Scatter(
+    if "South_Marengo" in intraday.columns:
+        south_mask = intraday["South_Marengo"] == "🐎"
+        if south_mask.any():
+            fig.add_trace(
+                go.Scatter(
                     x=intraday.loc[south_mask, "Time"],
-                    y=intraday.loc[south_mask, "F% Lower"] - offset_south,
+                    y=intraday.loc[south_mask, "F_numeric"] - 100,
                     mode="text",
-                    text=["🐎"] * int(south_mask.sum()),
-                    textfont=dict(size=22),
-                    textposition="bottom left",
-                    name="South Marengo",
-                    showlegend=True,
-                )
-                fig.add_trace(south_marengo_trace, row=1, col=1)
+                    text=["♞"] * int(south_mask.sum()),
+                    textfont=dict(size=24, color="#38BDF8"),
+                    textposition="bottom center",
+                    name="South Marengo ♞",
+                    showlegend=False,
+                    hovertemplate="Time: %{x}<br>F%: %{y}<br>♞ Marengo Down<extra></extra>",
+                ),
+                row=1, col=1,
+            )
 
-
-
-    # 🟢 STD Expansion (🐦‍🔥)
+    # 🟢 STD Expansion (♗)
     if "STD_Alert" in intraday.columns:
         mask_std_alert = intraday["STD_Alert"] != ""
 
         if mask_std_alert.any():
-            scatter_std_alert = go.Scatter(
-                x=intraday.loc[mask_std_alert, "Time"],
-                y=intraday.loc[mask_std_alert, "F_numeric"] - 32,  # vertical offset
-                mode="text",
-                text=intraday.loc[mask_std_alert, "STD_Alert"],
-                textposition="bottom center",
-                textfont=dict(size=11),
-                name="F% STD Expansion",
-                hovertemplate=(
-                    "Time: %{x}<br>"
-                    "F%: %{y}<br>"
-                    "STD Alert: %{text}<extra></extra>"
-                ),
-            )
+            if "Kijun_F" in intraday.columns:
+                mike   = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+                kijun  = pd.to_numeric(intraday["Kijun_F"],   errors="coerce")
+                above_mask = mask_std_alert & (mike >= kijun)
+                below_mask = mask_std_alert & (mike <  kijun)
+            else:
+                above_mask = mask_std_alert
+                below_mask = pd.Series(False, index=intraday.index)
 
-            fig.add_trace(scatter_std_alert, row=1, col=1)
+            offset = 32
 
-
+            for mask, pos_offset, textpos in [
+                (above_mask, +offset, "top center"),
+                (below_mask, -offset, "bottom center"),
+            ]:
+                if mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=intraday.loc[mask, "Time"],
+                            y=intraday.loc[mask, "F_numeric"] + pos_offset,
+                            mode="text",
+                            text=["♗"] * int(mask.sum()),
+                            textposition=textpos,
+                            textfont=dict(size=24, color="#BF40BF"),
+                            name="STD Expansion ♗",
+                            showlegend=False,
+                            hovertemplate=(
+                                "Time: %{x}<br>"
+                                "F%: %{y}<br>"
+                                "STD Expansion ♗<extra></extra>"
+                            ),
+                        ),
+                        row=1, col=1,
+                    )
 
 
     # Initial Balance lines (manual F_numeric)
@@ -843,7 +933,7 @@ def build_chart(
                     x=intraday["Time"],
                     y=[ib_mid_third] * len(intraday),
                     mode="lines",
-                    line=dict(color="#d3d3d3", dash="dot", width=0.5),
+                    line=dict(color="#d3d3d3", dash="dot", width=0.2),
                     name="IB Mid Third",
                     showlegend=False,
                 ),
@@ -856,7 +946,7 @@ def build_chart(
                     x=intraday["Time"],
                     y=[ib_upper_third] * len(intraday),
                     mode="lines",
-                    line=dict(color="#d3d3d3", dash="dot", width=0.5),
+                    line=dict(color="#d3d3d3", dash="dot", width=0.2),
                     name="IB Upper Third",
                     showlegend=False,
                 ),
@@ -910,7 +1000,7 @@ def build_chart(
                 y=poc_f_level,
                 line_color="#ff1493",
                 line_dash="dot",
-                line_width=0.7,
+                line_width=0.2,
                 row=1,
                 col=1,
                 # annotation_text="👃🏽 Nose POC",
@@ -923,251 +1013,246 @@ def build_chart(
 
 
 
+    # # =============================
+    # # 🎯 ENTRY MARKERS (PUT / CALL)
+    # # =============================
+
+    # # --- PUT 🎯 / 🎯2 / 🎯3 ---
+    # if "Put_FirstEntry_Emoji" in intraday.columns:
+    #     first_entry_mask = intraday["Put_FirstEntry_Emoji"] == "🎯"
+    #     if first_entry_mask.any():
+    #         fig.add_trace(
+    #             go.Scatter(
+    #                 x=intraday.loc[first_entry_mask, "Time"],
+    #                 y=intraday.loc[first_entry_mask, "F_numeric"] - 34,
+    #                 mode="text",
+    #                 text=intraday.loc[first_entry_mask, "Put_FirstEntry_Emoji"],
+    #                 textposition="top center",
+    #                 textfont=dict(size=24),
+    #                 name="🎯 Put Entry 1",
+    #                 showlegend=False,
+    #                 hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
+    #             ),
+    #             row=1, col=1,
+    #         )
+
+    # if "Put_SecondEntry_Emoji" in intraday.columns:
+    #     second_entry_mask = intraday["Put_SecondEntry_Emoji"] == "🎯2"
+    #     if second_entry_mask.any():
+    #         fig.add_trace(
+    #             go.Scatter(
+    #                 x=intraday.loc[second_entry_mask, "Time"],
+    #                 y=intraday.loc[second_entry_mask, "F_numeric"] - 34,
+    #                 mode="text",
+    #                 text=intraday.loc[second_entry_mask, "Put_SecondEntry_Emoji"],
+    #                 textposition="top center",
+    #                 textfont=dict(size=24),
+    #                 name="🎯2 Put Entry 2",
+    #                 showlegend=False,
+    #                 hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
+    #             ),
+    #             row=1, col=1,
+    #         )
+
+    # if "Put_ThirdEntry_Emoji" in intraday.columns:
+    #     third_entry_mask = intraday["Put_ThirdEntry_Emoji"] == "🎯3"
+    #     if third_entry_mask.any():
+    #         fig.add_trace(
+    #             go.Scatter(
+    #                 x=intraday.loc[third_entry_mask, "Time"],
+    #                 y=intraday.loc[third_entry_mask, "F_numeric"] - 34,
+    #                 mode="text",
+    #                 text=intraday.loc[third_entry_mask, "Put_ThirdEntry_Emoji"],
+    #                 textposition="top center",
+    #                 textfont=dict(size=24),
+    #                 name="🎯3 Put Entry 3",
+    #                 showlegend=False,
+    #                 hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
+    #             ),
+    #             row=1, col=1,
+    #         )
+
+    # # --- CALL 🎯 / 🎯2 / 🎯3 ---
+    # if "Call_FirstEntry_Emoji" in intraday.columns:
+    #     call1_mask = intraday["Call_FirstEntry_Emoji"] == "🎯"
+    #     if call1_mask.any():
+    #         fig.add_trace(
+    #             go.Scatter(
+    #                 x=intraday.loc[call1_mask, "Time"],
+    #                 y=intraday.loc[call1_mask, "F_numeric"] + 34,
+    #                 mode="text",
+    #                 text=intraday.loc[call1_mask, "Call_FirstEntry_Emoji"],
+    #                 textposition="top center",
+    #                 textfont=dict(size=24),
+    #                 name="🎯 Call Entry 1",
+    #                 showlegend=False,
+    #                 hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
+    #             ),
+    #             row=1, col=1,
+    #         )
+
+    # if "Call_SecondEntry_Emoji" in intraday.columns:
+    #     call2_mask = intraday["Call_SecondEntry_Emoji"] == "🎯2"
+    #     if call2_mask.any():
+    #         fig.add_trace(
+    #             go.Scatter(
+    #                 x=intraday.loc[call2_mask, "Time"],
+    #                 y=intraday.loc[call2_mask, "F_numeric"] + 34,
+    #                 mode="text",
+    #                 text=intraday.loc[call2_mask, "Call_SecondEntry_Emoji"],
+    #                 textposition="top center",
+    #                 textfont=dict(size=24),
+    #                 name="🎯2 Call Entry 2",
+    #                 showlegend=False,
+    #                 hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
+    #             ),
+    #             row=1, col=1,
+    #         )
+
+    # if "Call_ThirdEntry_Emoji" in intraday.columns:
+    #     call3_mask = intraday["Call_ThirdEntry_Emoji"] == "🎯3"
+    #     if call3_mask.any():
+    #         fig.add_trace(
+    #             go.Scatter(
+    #                 x=intraday.loc[call3_mask, "Time"],
+    #                 y=intraday.loc[call3_mask, "F_numeric"] + 34,
+    #                 mode="text",
+    #                 text=intraday.loc[call3_mask, "Call_ThirdEntry_Emoji"],
+    #                 textposition="top center",
+    #                 textfont=dict(size=24),
+    #                 name="🎯3 Call Entry 3",
+    #                 showlegend=False,
+    #                 hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
+    #             ),
+    #             row=1, col=1,
+    #         )
+
+
+
     # =============================
     # 🎯 ENTRY MARKERS (PUT / CALL)
     # =============================
 
-    # --- PUT 🎯 / 🎯2 / 🎯3 ---
-    if "Put_FirstEntry_Emoji" in intraday.columns:
-        first_entry_mask = intraday["Put_FirstEntry_Emoji"] == "🎯"
-        if first_entry_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[first_entry_mask, "Time"],
-                    y=intraday.loc[first_entry_mask, "F_numeric"] - 34,
-                    mode="text",
-                    text=intraday.loc[first_entry_mask, "Put_FirstEntry_Emoji"],
-                    textposition="top center",
-                    textfont=dict(size=24),
-                    name="🎯 Put Entry 1",
-                    showlegend=False,
-                    hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
-                ),
-                row=1, col=1,
-            )
+    for side, offset, cols in [
+        ("call", +34, {
+            "exec":    "Call_FirstEntry_Emoji",
+            "hold":    "Call_FirstEntry_Emoji",
+            "reclaim": "Call_DeferredEntry_Emoji",
+            "e2":      "Call_SecondEntry_Emoji",
+            "e3":      "Call_ThirdEntry_Emoji",
+        }),
+        ("put", -34, {
+            "exec":    "Put_FirstEntry_Emoji",
+            "hold":    "Put_FirstEntry_Emoji",
+            "reclaim": "Put_DeferredEntry_Emoji",
+            "e2":      "Put_SecondEntry_Emoji",
+            "e3":      "Put_ThirdEntry_Emoji",
+        }),
+    ]:
+        label = side.upper()
 
-    if "Put_SecondEntry_Emoji" in intraday.columns:
-        second_entry_mask = intraday["Put_SecondEntry_Emoji"] == "🎯2"
-        if second_entry_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[second_entry_mask, "Time"],
-                    y=intraday.loc[second_entry_mask, "F_numeric"] - 34,
-                    mode="text",
-                    text=intraday.loc[second_entry_mask, "Put_SecondEntry_Emoji"],
-                    textposition="top center",
-                    textfont=dict(size=24),
-                    name="🎯2 Put Entry 2",
-                    showlegend=False,
-                    hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
-                ),
-                row=1, col=1,
-            )
-
-    if "Put_ThirdEntry_Emoji" in intraday.columns:
-        third_entry_mask = intraday["Put_ThirdEntry_Emoji"] == "🎯3"
-        if third_entry_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[third_entry_mask, "Time"],
-                    y=intraday.loc[third_entry_mask, "F_numeric"] - 34,
-                    mode="text",
-                    text=intraday.loc[third_entry_mask, "Put_ThirdEntry_Emoji"],
-                    textposition="top center",
-                    textfont=dict(size=24),
-                    name="🎯3 Put Entry 3",
-                    showlegend=False,
-                    hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
-                ),
-                row=1, col=1,
-            )
-
-    # --- CALL 🎯 / 🎯2 / 🎯3 ---
-    if "Call_FirstEntry_Emoji" in intraday.columns:
-        call1_mask = intraday["Call_FirstEntry_Emoji"] == "🎯"
-        if call1_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[call1_mask, "Time"],
-                    y=intraday.loc[call1_mask, "F_numeric"] + 34,
-                    mode="text",
-                    text=intraday.loc[call1_mask, "Call_FirstEntry_Emoji"],
-                    textposition="top center",
-                    textfont=dict(size=24),
-                    name="🎯 Call Entry 1",
-                    showlegend=False,
-                    hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
-                ),
-                row=1, col=1,
-            )
-
-    if "Call_SecondEntry_Emoji" in intraday.columns:
-        call2_mask = intraday["Call_SecondEntry_Emoji"] == "🎯2"
-        if call2_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[call2_mask, "Time"],
-                    y=intraday.loc[call2_mask, "F_numeric"] + 34,
-                    mode="text",
-                    text=intraday.loc[call2_mask, "Call_SecondEntry_Emoji"],
-                    textposition="top center",
-                    textfont=dict(size=24),
-                    name="🎯2 Call Entry 2",
-                    showlegend=False,
-                    hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
-                ),
-                row=1, col=1,
-            )
-
-    if "Call_ThirdEntry_Emoji" in intraday.columns:
-        call3_mask = intraday["Call_ThirdEntry_Emoji"] == "🎯3"
-        if call3_mask.any():
-            fig.add_trace(
-                go.Scatter(
-                    x=intraday.loc[call3_mask, "Time"],
-                    y=intraday.loc[call3_mask, "F_numeric"] + 34,
-                    mode="text",
-                    text=intraday.loc[call3_mask, "Call_ThirdEntry_Emoji"],
-                    textposition="top center",
-                    textfont=dict(size=24),
-                    name="🎯3 Call Entry 3",
-                    showlegend=False,
-                    hovertemplate="Time: %{x}<br>F%: %{y}<extra></extra>",
-                ),
-                row=1, col=1,
-            )
-
-
-    # ==========================
-    # 🧿 E1 Evil Eye (Kijun cross at E1)
-    # ==========================
-    if "E1_EvilEye_Emoji" in intraday.columns:
-        evil_mask = intraday["E1_EvilEye_Emoji"] == "🧿"
-
-        if evil_mask.any():
-            # 🧿 on CALL E1 bars → above the existing 🎯 (which is at F + 34)
-            call_mask = evil_mask & (intraday.get("Call_FirstEntry_Emoji", "") == "🎯")
-            if call_mask.any():
+        # 🎯 EXEC
+        col = cols["exec"]
+        if col in intraday.columns:
+            mask = intraday[col] == "🎯"
+            if mask.any():
                 fig.add_trace(
                     go.Scatter(
-                        x=intraday.loc[call_mask, "Time"],
-                        y=intraday.loc[call_mask, "F_numeric"] + 64,  # a bit higher than 🎯
+                        x=intraday.loc[mask, "Time"],
+                        y=intraday.loc[mask, "F_numeric"] + offset,
                         mode="text",
-                        text=["🧿"] * int(call_mask.sum()),
-                        textposition="middle left",
-                        textfont=dict(size=22),
-                        name="E1 Evil Eye (Call)",
-                        hovertemplate=(
-                            "Time: %{x}<br>"
-                            "F%: %{y}<br>"
-                            "E1 Kijun cross 🧿<extra></extra>"
-                        ),
+                        text=["🎯"] * int(mask.sum()),
+                        textposition="middle center",
+                        textfont=dict(size=24),
+                        name=f"🎯 E1 {label}",
                         showlegend=False,
+                        hovertemplate=f"Time: %{{x}}<br>F%: %{{y}}<br>🎯 Entry 1 {label}<extra></extra>",
                     ),
-                    row=1,
-                    col=1,
+                    row=1, col=1,
                 )
 
-            # 🧿 on PUT E1 bars → below the existing 🎯 (which is at F - 34)
-            put_mask = evil_mask & (intraday.get("Put_FirstEntry_Emoji", "") == "🎯")
-            if put_mask.any():
+        # ⏳ HOLD
+        col = cols["hold"]
+        if col in intraday.columns:
+            mask = intraday[col] == "⏳"
+            if mask.any():
                 fig.add_trace(
                     go.Scatter(
-                        x=intraday.loc[put_mask, "Time"],
-                        y=intraday.loc[put_mask, "F_numeric"] - 64,  # a bit farther than 🎯
+                        x=intraday.loc[mask, "Time"],
+                        y=intraday.loc[mask, "F_numeric"] + offset,
                         mode="text",
-                        text=["🧿"] * int(put_mask.sum()),
-                        textposition="middle left",
-                        textfont=dict(size=22),
-                        name="E1 Evil Eye (Put)",
-                        hovertemplate=(
-                            "Time: %{x}<br>"
-                            "F%: %{y}<br>"
-                            "E1 Kijun cross 🧿<extra></extra>"
-                        ),
+                        text=["⏳"] * int(mask.sum()),
+                        textposition="middle center",
+                        textfont=dict(size=24),
+                        name=f"⏳ HOLD {label}",
                         showlegend=False,
+                        hovertemplate=f"Time: %{{x}}<br>F%: %{{y}}<br>⏳ Blocked E1 {label}<extra></extra>",
                     ),
-                    row=1,
-                    col=1,
+                    row=1, col=1,
                 )
 
-    # ==========================
-    # 🚪 T0 DOOR MARKER (relative to Kijun)
-    # ==========================
-    if "T0_Emoji" in intraday.columns:
-        t0_mask = intraday["T0_Emoji"] == "🚪"
-
-        if t0_mask.any():
-            offset = 50  # how far above/below Mike
-
-            if "Kijun_F" in intraday.columns:
-                mike = pd.to_numeric(intraday["F_numeric"], errors="coerce")
-                kijun = pd.to_numeric(intraday["Kijun_F"], errors="coerce")
-
-                below_mask = t0_mask & (mike < kijun)
-                above_mask = t0_mask & (mike >= kijun)
-
-                # 🚪 under Mike when below Kijun
-                if below_mask.any():
-                    fig.add_trace(
-                        go.Scatter(
-                            x=intraday.loc[below_mask, "Time"],
-                            y=intraday.loc[below_mask, "F_numeric"] - offset,
-                            mode="text",
-                            text=["🚪"] * int(below_mask.sum()),
-                            textposition="middle left",
-                            textfont=dict(size=18, color="orange"),
-                            name="T0 Door",
-                            hovertemplate=(
-                                "Time: %{x}<br>"
-                                "F%: %{y}<br>"
-                                "T0 Door 🚪<extra></extra>"
-                            ),
-                        ),
-                        row=1,
-                        col=1,
-                    )
-
-                # 🚪 above Mike when above Kijun
-                if above_mask.any():
-                    fig.add_trace(
-                        go.Scatter(
-                            x=intraday.loc[above_mask, "Time"],
-                            y=intraday.loc[above_mask, "F_numeric"] + offset,
-                            mode="text",
-                            text=["🚪"] * int(above_mask.sum()),
-                            textposition="middle left",
-                            textfont=dict(size=18, color="orange"),
-                            name="T0 Door",
-                            hovertemplate=(
-                                "Time: %{x}<br>"
-                                "F%: %{y}<br>"
-                                "T0 Door 🚪<extra></extra>"
-                            ),
-                        ),
-                        row=1,
-                        col=1,
-                    )
-            else:
-                # fallback: always under Mike
+        # 🧿 RECLAIM
+        col = cols["reclaim"]
+        if col in intraday.columns:
+            mask = intraday[col] == "🧿"
+            if mask.any():
                 fig.add_trace(
                     go.Scatter(
-                        x=intraday.loc[t0_mask, "Time"],
-                        y=intraday.loc[t0_mask, "F_numeric"] - offset,
+                        x=intraday.loc[mask, "Time"],
+                        y=intraday.loc[mask, "F_numeric"] + offset,
                         mode="text",
-                        text=["🚪"] * int(t0_mask.sum()),
-                        textposition="middle left",
-                        textfont=dict(size=18, color="orange"),
-                        name="T0 Door",
-                        hovertemplate=(
-                            "Time: %{x}<br>"
-                            "F%: %{y}<br>"
-                            "T0 Door 🚪<extra></extra>"
-                        ),
+                        text=["🧿"] * int(mask.sum()),
+                        textposition="middle center",
+                        textfont=dict(size=24),
+                        name=f"🧿 RECLAIM {label}",
+                        showlegend=False,
+                        hovertemplate=f"Time: %{{x}}<br>F%: %{{y}}<br>🧿 Reclaim {label}<extra></extra>",
                     ),
-                    row=1,
-                    col=1,
+                    row=1, col=1,
                 )
+
+        # 🎯2 E2
+        col = cols["e2"]
+        if col in intraday.columns:
+            mask = intraday[col] == "🎯2"
+            if mask.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=intraday.loc[mask, "Time"],
+                        y=intraday.loc[mask, "F_numeric"] + offset,
+                        mode="text",
+                        text=["🎯2"] * int(mask.sum()),
+                        textposition="middle center",
+                        textfont=dict(size=24),
+                        name=f"🎯2 E2 {label}",
+                        showlegend=False,
+                        hovertemplate=f"Time: %{{x}}<br>F%: %{{y}}<br>🎯2 Entry 2 {label}<extra></extra>",
+                    ),
+                    row=1, col=1,
+                )
+
+        # 🎯3 E3
+        col = cols["e3"]
+        if col in intraday.columns:
+            mask = intraday[col] == "🎯3"
+            if mask.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=intraday.loc[mask, "Time"],
+                        y=intraday.loc[mask, "F_numeric"] + offset,
+                        mode="text",
+                        text=["🎯3"] * int(mask.sum()),
+                        textposition="middle center",
+                        textfont=dict(size=24),
+                        name=f"🎯3 E3 {label}",
+                        showlegend=False,
+                        hovertemplate=f"Time: %{{x}}<br>F%: %{{y}}<br>🎯3 Entry 3 {label}<extra></extra>",
+                    ),
+                    row=1, col=1,
+                )
+
+
+
 
     # ==========================
     # 🏇🏼 T1 HORSE MARKER
@@ -1207,7 +1292,37 @@ def build_chart(
                         col=1,
                     )
 
-                # 🏇🏼 ABOVE Mike
+                # ==========================
+    # 🏇🏼 T1 HORSE MARKER
+    # ==========================
+    if "T1_Emoji" in intraday.columns:
+        t1_mask = intraday["T1_Emoji"] == "🏇🏼"
+
+        if t1_mask.any():
+            offset = 120  # ← was 50, pushed further out
+
+            if "Kijun_F" in intraday.columns:
+                mike  = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+                kijun = pd.to_numeric(intraday["Kijun_F"],   errors="coerce")
+                below_mask = t1_mask & (mike <  kijun)
+                above_mask = t1_mask & (mike >= kijun)
+
+                if below_mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=intraday.loc[below_mask, "Time"],
+                            y=intraday.loc[below_mask, "F_numeric"] - offset,
+                            mode="text",
+                            text=["🏇🏼"] * int(below_mask.sum()),
+                            textposition="middle center",
+                            textfont=dict(size=36, color="mediumvioletred"),  # ← was 22
+                            name="T1 Horse",
+                            showlegend=False,
+                            hovertemplate="Time: %{x}<br>F%: %{y}<br>T1 Horse 🏇🏼<extra></extra>",
+                        ),
+                        row=1, col=1,
+                    )
+
                 if above_mask.any():
                     fig.add_trace(
                         go.Scatter(
@@ -1216,19 +1331,14 @@ def build_chart(
                             mode="text",
                             text=["🏇🏼"] * int(above_mask.sum()),
                             textposition="middle center",
-                            textfont=dict(size=22, color="mediumvioletred"),
+                            textfont=dict(size=36, color="mediumvioletred"),  # ← was 29
                             name="T1 Horse",
-                            hovertemplate=(
-                                "Time: %{x}<br>"
-                                "F%: %{y}<br>"
-                                "T1 Horse 🏇🏼<extra></extra>"
-                            ),
+                            showlegend=False,
+                            hovertemplate="Time: %{x}<br>F%: %{y}<br>T1 Horse 🏇🏼<extra></extra>",
                         ),
-                        row=1,
-                        col=1,
+                        row=1, col=1,
                     )
             else:
-                # fallback: always above Mike
                 fig.add_trace(
                     go.Scatter(
                         x=intraday.loc[t1_mask, "Time"],
@@ -1236,16 +1346,12 @@ def build_chart(
                         mode="text",
                         text=["🏇🏼"] * int(t1_mask.sum()),
                         textposition="middle center",
-                        textfont=dict(size=22, color="mediumvioletred"),
+                        textfont=dict(size=36, color="mediumvioletred"),
                         name="T1 Horse",
-                        hovertemplate=(
-                            "Time: %{x}<br>"
-                            "F%: %{y}<br>"
-                            "T1 Horse 🏇🏼<extra></extra>"
-                        ),
+                        showlegend=False,
+                        hovertemplate="Time: %{x}<br>F%: %{y}<br>T1 Horse 🏇🏼<extra></extra>",
                     ),
-                    row=1,
-                    col=1,
+                    row=1, col=1,
                 )
 
 
@@ -1329,6 +1435,122 @@ def build_chart(
                 )
 
 # ==========================
+    # ♚ KING (T2 bars)
+    # ==========================
+    if "T2_Emoji" in intraday.columns:
+        king_mask = intraday["T2_Emoji"] == "⚡"
+        if king_mask.any():
+            if "Kijun_F" in intraday.columns:
+                mike  = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+                kijun = pd.to_numeric(intraday["Kijun_F"],   errors="coerce")
+                above_mask = king_mask & (mike >= kijun)
+                below_mask = king_mask & (mike <  kijun)
+            else:
+                above_mask = king_mask
+                below_mask = pd.Series(False, index=intraday.index)
+
+            for mask, pos_offset, textpos in [
+                (above_mask, +94, "top center"),
+                (below_mask, -94, "bottom center"),
+            ]:
+                if mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=intraday.loc[mask, "Time"],
+                            y=intraday.loc[mask, "F_numeric"] + pos_offset,
+                            mode="text",
+                            text=["♚"] * int(mask.sum()),
+                            textposition=textpos,
+                            textfont=dict(size=44, color="#F59E0B"),
+                            name="King ♚",
+                            showlegend=False,
+                            hovertemplate=(
+                                "Time: %{x}<br>"
+                                "F%: %{y}<br>"
+                                "♚ KING<extra></extra>"
+                            ),
+                        ),
+                        row=1, col=1,
+                    )
+
+
+
+
+    # ==========================
+    # MIKE LINE (Z3 engine paint)
+    # ==========================
+    TH = 1.5
+    MIKE_BLUE  = "#1E90FF"
+    MIKE_GREEN = "#22c55e"
+    MIKE_RED   = "#ff3b3b"
+
+    def color_for_z3(z):
+        if pd.notna(z):
+            if z >= TH:  return MIKE_GREEN
+            if z <= -TH: return MIKE_RED
+        return MIKE_BLUE
+
+    # Build color per bar
+    z3_scores = intraday["Z3_Score"] if "Z3_Score" in intraday.columns else pd.Series(float("nan"), index=intraday.index)
+    bar_colors = [color_for_z3(z) for z in z3_scores]
+
+    # Split into contiguous same-color segments
+    segments = []
+    seg_start = 0
+    for i in range(1, len(intraday)):
+        if bar_colors[i] != bar_colors[i - 1]:
+            segments.append((seg_start, i, bar_colors[i - 1]))
+            seg_start = i - 1  # overlap by 1 so segments connect
+    segments.append((seg_start, len(intraday) - 1, bar_colors[-1]))
+
+    for seg_start, seg_end, color in segments:
+        seg = intraday.iloc[seg_start: seg_end + 1]
+        if len(seg) < 2:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=seg["Time"],
+                y=seg["F_numeric"],
+                mode="lines",
+                line=dict(width=2, color=color),
+                showlegend=False,
+                name="Mike",
+                hovertemplate=(
+                    "Time: %{x}<br>"
+                    "F: %{y:.0f}<extra></extra>"
+                ),
+            ),
+            row=1, col=1,
+        )
+
+    # Dots on top (separate trace, always blue so they don't override segment color)
+    fig.add_trace(
+        go.Scatter(
+            x=intraday["Time"],
+            y=intraday["F_numeric"],
+            mode="markers",
+            marker=dict(size=3, color=bar_colors),
+            showlegend=False,
+            name="Mike dots",
+            customdata=np.stack([
+                intraday["Close"],
+                intraday["Volume"],
+                intraday["RVOL_5"],
+            ], axis=-1),
+            hovertemplate=(
+                "Time: %{x}<br>"
+                "F: %{y:.0f}<br>"
+                "Close: %{customdata[0]:.2f}<br>"
+                "Volume: %{customdata[1]:,.0f}<br>"
+                "RVOL_5: %{customdata[2]:.2f}"
+                "<extra></extra>"
+            ),
+        ),
+        row=1, col=1,
+    )
+
+
+    # ==========================
     # 🏁 / 🚩 PARALLEL PHASE (start + end flags)
     # ==========================
     if "Parallel_Emoji" in intraday.columns:
@@ -1371,33 +1593,236 @@ def build_chart(
                     ),
                     row=1, col=1,
                 )
-    # ==========================
-    # 💰 Goldmine from E1
-    # ==========================
-    if "Goldmine_E1_Emoji" in intraday.columns:
-        gm_mask = intraday["Goldmine_E1_Emoji"] == "💰"
+    # # ==========================
+    # # 💰 Goldmine from E1
+    # # ==========================
+    # if "Goldmine_E1_Emoji" in intraday.columns:
+    #     gm_mask = intraday["Goldmine_E1_Emoji"] == "💰"
 
-        if gm_mask.any():
+    #     if gm_mask.any():
+    #         fig.add_trace(
+    #             go.Scatter(
+    #                 x=intraday.loc[gm_mask, "Time"],
+    #                 y=intraday.loc[gm_mask, "F_numeric"] + 120,  # tune offset
+    #                 mode="text",
+    #                 text=["💰"] * int(gm_mask.sum()),
+    #                 textposition="middle center",
+    #                 textfont=dict(size=18, color="gold"),
+    #                 name="Goldmine E1",
+    #                 hovertemplate=(
+    #                     "Time: %{x}<br>"
+    #                     "F%: %{y}<br>"
+    #                     "Goldmine from Entry-1 💰 (+64F gain)"
+    #                     "<extra></extra>"
+    #                 ),
+    #             ),
+    #             row=1, col=1,
+    #         )
+
+
+    # ==========================
+    # RVOL ♘
+    # ==========================
+    if "RVOL_5" in intraday.columns and "F_numeric" in intraday.columns:
+        mask_rvol = pd.to_numeric(intraday["RVOL_5"], errors="coerce") > 1.2
+
+        if mask_rvol.any():
+            if "Kijun_F" in intraday.columns:
+                mike  = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+                kijun = pd.to_numeric(intraday["Kijun_F"],   errors="coerce")
+                above_mask = mask_rvol & (mike >= kijun)
+                below_mask = mask_rvol & (mike <  kijun)
+            else:
+                above_mask = mask_rvol
+                below_mask = pd.Series(False, index=intraday.index)
+
+            for mask, pos_offset, textpos, color in [
+                (above_mask, +50, "top center",    "#22c55e"),
+                (below_mask, -50, "bottom center", "#ff3b3b"),
+            ]:
+                if mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=intraday.loc[mask, "Time"],
+                            y=intraday.loc[mask, "F_numeric"] + pos_offset,
+                            mode="text",
+                            text=["♘"] * int(mask.sum()),
+                            textposition=textpos,
+                            textfont=dict(size=26, color=color),
+                            name="RVOL ♘",
+                            showlegend=False,
+                            customdata=intraday.loc[mask, "RVOL_5"].values,
+                            hovertemplate=(
+                                "Time: %{x}<br>"
+                                "F%: %{y}<br>"
+                                "♘ RVOL: %{customdata:.2f}<extra></extra>"
+                            ),
+                        ),
+                        row=1, col=1,
+                    )
+    # ==========================
+    # ♖ ROOK (TD line cross)
+    # ==========================
+    if "F_numeric" in intraday.columns:
+        mike = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+        COOLDOWN_R = 10
+        EPS_R      = 6
+        last_r     = -999
+        rook_hits  = []
+
+        td_candidates = [
+            ("TD Demand", "TD Demand Line F"),
+            ("TD Supply", "TD Supply Line F"),
+        ]
+
+        for i in range(1, len(intraday)):
+            m0, m1 = mike.iloc[i], mike.iloc[i - 1]
+            if pd.isna(m0) or pd.isna(m1):
+                continue
+            hit = None
+            for name, col in td_candidates:
+                if col not in intraday.columns:
+                    continue
+                t0 = pd.to_numeric(intraday[col].iloc[i],     errors="coerce")
+                t1 = pd.to_numeric(intraday[col].iloc[i - 1], errors="coerce")
+                if pd.isna(t0) or pd.isna(t1):
+                    continue
+                prev_state = 1 if m1 > t1 + EPS_R else (-1 if m1 < t1 - EPS_R else 0)
+                curr_state = 1 if m0 > t0 + EPS_R else (-1 if m0 < t0 - EPS_R else 0)
+                if prev_state == 0 or curr_state == 0 or prev_state == curr_state:
+                    continue
+                hit = {"up_cross": prev_state == -1 and curr_state == 1, "label": f"{name} Cross"}
+                break
+            if hit is None:
+                continue
+            if i - last_r < COOLDOWN_R:
+                continue
+            rook_hits.append((i, hit))
+            last_r = i
+
+        for idx, hit in rook_hits:
+            color   = "#22c55e" if hit["up_cross"] else "#ff3b3b"
+            offset  = +50       if hit["up_cross"] else -50
+            textpos = "top center" if hit["up_cross"] else "bottom center"
             fig.add_trace(
                 go.Scatter(
-                    x=intraday.loc[gm_mask, "Time"],
-                    y=intraday.loc[gm_mask, "F_numeric"] + 120,  # tune offset
+                    x=[intraday["Time"].iloc[idx]],
+                    y=[mike.iloc[idx] + offset],
                     mode="text",
-                    text=["💰"] * int(gm_mask.sum()),
-                    textposition="middle center",
-                    textfont=dict(size=18, color="gold"),
-                    name="Goldmine E1",
+                    text=["♖"],
+                    textposition=textpos,
+                    textfont=dict(size=26, color=color),
+                    name="Rook ♖",
+                    showlegend=False,
                     hovertemplate=(
                         "Time: %{x}<br>"
                         "F%: %{y}<br>"
-                        "Goldmine from Entry-1 💰 (+64F gain)"
-                        "<extra></extra>"
+                        f"♖ {hit['label']}<extra></extra>"
                     ),
                 ),
                 row=1, col=1,
             )
 
+    # ==========================
+    # ♙ PAWN (TD line seatbelt)
+    # ==========================
+    if "F_numeric" in intraday.columns:
+        mike = pd.to_numeric(intraday["F_numeric"], errors="coerce")
+        COOLDOWN_P = 10
+        EPS_P      = 6
+        last_p     = -999
+        pawn_hits  = []
 
+        for i in range(1, len(intraday)):
+            m0, m1 = mike.iloc[i], mike.iloc[i - 1]
+            if pd.isna(m0) or pd.isna(m1):
+                continue
+            hit = None
+            for name, col in td_candidates:
+                if col not in intraday.columns:
+                    continue
+                t0 = pd.to_numeric(intraday[col].iloc[i],     errors="coerce")
+                t1 = pd.to_numeric(intraday[col].iloc[i - 1], errors="coerce")
+                if pd.isna(t0) or pd.isna(t1):
+                    continue
+                prev_state = 1 if m1 > t1 + EPS_P else (-1 if m1 < t1 - EPS_P else 0)
+                curr_state = 1 if m0 > t0 + EPS_P else (-1 if m0 < t0 - EPS_P else 0)
+                if prev_state == 0 or curr_state == 0 or prev_state == curr_state:
+                    continue
+                hit = {"up_cross": prev_state == -1 and curr_state == 1, "label": f"{name} Seatbelt"}
+                break
+            if hit is None:
+                continue
+            if i - last_p < COOLDOWN_P:
+                continue
+            pawn_hits.append((i, hit))
+            last_p = i
+
+        for idx, hit in pawn_hits:
+            color   = "#22c55e" if hit["up_cross"] else "#ff3b3b"
+            offset  = +50       if hit["up_cross"] else -50
+            textpos = "top center" if hit["up_cross"] else "bottom center"
+            fig.add_trace(
+                go.Scatter(
+                    x=[intraday["Time"].iloc[idx]],
+                    y=[mike.iloc[idx] + offset],
+                    mode="text",
+                    text=["♙"],
+                    textposition=textpos,
+                    textfont=dict(size=24, color=color),
+                    name="Seatbelt ♙",
+                    showlegend=False,
+                    hovertemplate=(
+                        "Time: %{x}<br>"
+                        "F%: %{y}<br>"
+                        f"♙ {hit['label']}<extra></extra>"
+                    ),
+                ),
+                row=1, col=1,
+            )
+
+    # ==========================
+    # 🔑 Z3 KEY MARKER
+    # ==========================
+    if "Z3_Key_Emoji" in intraday.columns:
+        z3_mask = intraday["Z3_Key_Emoji"] == "🔑"
+        if z3_mask.any():
+            z3_row = intraday[z3_mask].iloc[0]
+            z3_score = z3_row.get("Z3_Score", float("nan"))
+            z3_side  = z3_row.get("Z3_Key_Side", "call")
+            z3_f     = float(z3_row["F_numeric"])
+
+            # Position: above Mike for call signal, below for put
+            if "Kijun_F" in intraday.columns:
+                kijun_val = pd.to_numeric(
+                    intraday.loc[z3_mask, "Kijun_F"], errors="coerce"
+                ).iloc[0]
+                offset = 90 if z3_f >= kijun_val else -90
+            else:
+                offset = 90 if z3_side == "call" else -90
+
+            score_str = f"{z3_score:.2f}" if not np.isnan(z3_score) else "n/a"
+            fig.add_trace(
+                go.Scatter(
+                    x=intraday.loc[z3_mask, "Time"].iloc[:1],
+                    y=[z3_f + offset],
+                    mode="text",
+                    text=["🔑"],
+                    textposition="middle center",
+                    textfont=dict(size=24),
+                    name="Z3 Key 🔑",
+                    showlegend=False,
+                    hovertemplate=(
+                        "Time: %{x}<br>"
+                        f"F%: {z3_f:.0f}<br>"
+                        f"Z3: {score_str}<br>"
+                        f"Side: {z3_side}<br>"
+                        "Z3 Key — favorable ignition after MAE"
+                        "<extra></extra>"
+                    ),
+                ),
+                row=1, col=1,
+            )
 
          # Nose (dominant TPO)
     poc_f_level = None
@@ -1590,6 +2015,9 @@ def run_ticker_analysis(
     intraday = apply_goldmine_e1(intraday, dist=64)
 
     intraday = apply_e1_kijun_evil_eye(intraday)
+
+    # Z3 momentum score + Key signal (🔑)
+    intraday = apply_z3_key(intraday, threshold=1.5)
 
 
 
