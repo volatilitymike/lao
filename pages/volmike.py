@@ -72,7 +72,7 @@ st.set_page_config(
 st.sidebar.header("Input Options")
 
 DEFAULT_TICKERS = [
-  "ES=F",  "NQ=F","YM=F","CL=F","^VIX","SPY","VIXY","SOXX","NVDA","AMZN","MU","NQ=F","AMD","QCOM","SMCI","MSFT","uber", "AVGO","MRVL","QQQ","PLTR","AAPL","GOOGL","META","XLY","TSLA","nke","GM","c","DKNG","CHWY","ETSY","CART","W","KBE","wfc","hood","PYPL","coin","bac","jpm",
+  "ES=F",  "NQ=F","YM=F","CL=F","^VIX","UVXY","SPY","VIXY","SOXX","NVDA","AMZN","MU","NQ=F","AMD","QCOM","SMCI","MSFT","uber", "AVGO","MRVL","QQQ","PLTR","AAPL","GOOGL","META","XLY","TSLA","nke","GM","c","DKNG","CHWY","ETSY","CART","W","KBE","wfc","hood","PYPL","coin","bac","jpm",
 ]
 
 tickers = st.sidebar.multiselect(
